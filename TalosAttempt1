@@ -1,0 +1,125 @@
+Talos ↔ Alisys setup (step-by-step, copy-paste)
+
+Doel: Alisys-gateway container starten, ROS2-nodes lanceren, JWT token ophalen en in de juiste nodes zetten.
+
+Use 2–3 terminals:
+T1 = container runnen, T2 = launch (leave open), T3 = token & checks.
+Paste all code prompts one block at a time and press Enter. Wait till the prompt ($) is back.
+
+---------------------------------------------------------------------------------------------------------------------
+
+0) Map in (projectfolder)
+
+cd ~/talos_adapter
+
+1) Start container
+
+docker compose up -d
+docker ps --format "table {{.Names}}\t{{.Status}}" | grep alisys_gateway
+
+
+You have to see Running alisys_gateway.
+
+---------------------------------------------------------------------------------------------------------------------
+
+2) (T2) ROS2 bringup start (leave this terminal open for status checking)
+
+docker exec -it alisys_gateway bash -lc '
+export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+export ROS_LOCALHOST_ONLY=1
+source /opt/ros/*/setup.bash && source /ros2_ws/install/setup.bash &&
+ros2 launch talos_bringup bringup.launch.py \
+  control_type:=cmd_vel control_topic:=/cmd_vel \
+  run_computer_telemetry:=True max_stream_consumers:=1'
+
+
+Let this run. Open a new terminal for the next steps.
+
+---------------------------------------------------------------------------------------------------------------------
+
+3) (T3) Basis-params voor token manager zetten
+
+(set params again if needed.)
+
+docker exec -it alisys_gateway bash -lc '
+source /opt/ros/*/setup.bash && source /ros2_ws/install/setup.bash &&
+ros2 param set /token_manager_node/token_manager_node login_url https://robotics-demo.alisys.net/alisys-robotics/svc-robot/v1/login &&
+ros2 param set /token_manager_node/token_manager_node uuid indymo &&
+ros2 param set /token_manager_node/token_manager_node key  b4af600d39baa078efbe34f10bd935ded95e4943bf799b1d340ff9793b753ee4c962864f &&
+echo OK'
+
+
+Check (optional):
+
+docker exec -it alisys_gateway bash -lc '
+source /opt/ros/*/setup.bash && source /ros2_ws/install/setup.bash &&
+echo -n "login_url: "; ros2 param get /token_manager_node/token_manager_node login_url | head -c 80; echo;
+echo -n "uuid:      "; ros2 param get /token_manager_node/token_manager_node uuid      | head -c 40; echo;
+echo -n "key:       "; ros2 param get /token_manager_node/token_manager_node key       >/dev/null 2>&1; echo "(set)"'
+
+---------------------------------------------------------------------------------------------------------------------
+
+4) (T3) JWT token request (login) and storing locally.
+
+This fetches access_token and writes it to /tmp/jwt.txt.
+
+docker exec -it alisys_gateway bash -lc '
+UUID=$(ros2 param get /token_manager_node/token_manager_node uuid 2>/dev/null | awk "{print \$2}")
+KEY=$(ros2 param get /token_manager_node/token_manager_node key  2>/dev/null | awk "{print \$2}")
+curl -s -H "Content-Type: application/json" -X POST \
+  -d "{\"externalId\":\"$UUID\",\"token\":\"$KEY\"}" \
+  https://robotics-demo.alisys.net/alisys-robotics/svc-robot/v1/login \
+| python3 -c "import sys,json;print(json.load(sys.stdin).get(\"access_token\",\"\"))" \
+| tee /tmp/jwt.txt >/dev/null;
+printf "JWT prefix: %s\n" "$(head -c 32 /tmp/jwt.txt; echo ...)"'
+
+
+---------------------------------------------------------------------------------------------------------------------
+
+
+5) (T3) Wait till you see nodes, after that inject the token
+
+docker exec -it alisys_gateway bash -lc '
+source /opt/ros/*/setup.bash && source /ros2_ws/install/setup.bash
+T=$(cat /tmp/jwt.txt)
+for i in $(seq 1 120); do
+  for N in /teleoperation_node/teleoperation_node \
+           /robot_status_client_node/robot_status_client_node \
+           /file_exchange_node \
+           /webrtc_server
+  do
+    if ros2 param list "$N" 2>/dev/null | grep -qx token; then
+      ros2 param set "$N" token "$T" >/dev/null 2>&1 && echo "SET: $N"
+    fi
+  done
+  ros2 param get /teleoperation_node/teleoperation_node token 2>/dev/null | grep -q "^ey" && echo "OK" && exit 0
+  sleep 1
+done
+echo "WARNING: tokens not set"
+exit 1'
+
+---------------------------------------------------------------------------------------------------------------------
+
+
+6) (T3) Check for token
+
+docker exec -it alisys_gateway bash -lc '
+source /opt/ros/*/setup.bash && source /ros2_ws/install/setup.bash
+for N in /teleoperation_node/teleoperation_node \
+         /robot_status_client_node/robot_status_client_node \
+         /file_exchange_node \
+         /webrtc_server
+do
+  echo -n "$N: "
+  ros2 param get "$N" token 2>/dev/null | head -c 40; echo
+done'
+
+
+You might see empty lines or nothing and it might just keep running.
+
+This is our result so far (we are stuck)
+
+---------------------------------------------------------------------------------------------------------------------
+
+
+For our second attempt we will use the new adapter, more on that in a different document/readme
